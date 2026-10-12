@@ -1,0 +1,277 @@
+//context/GameContext.jsx
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import * as api from "../services/api.js";
+import { AuthContext } from "./AuthContext.jsx";
+import { WalletContext } from "./WalletContext.jsx";
+import { useServerTime } from "../hooks/useServerTime.js";
+import { useWebSocket } from "../hooks/useWebSocket.js";
+
+export const GameContext = createContext(null);
+
+// crypto.randomUUID() is only available in secure contexts (HTTPS or
+// localhost). On a LAN IP like http://192.168.x.x it's undefined, so fall
+// back to a simple id generator in that case.
+function generateId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
+// Mirrors api/game_engine.py's calculate_multiplier — used ONLY to interpolate
+// the animation smoothly between authoritative server broadcasts. The actual
+// payout multiplier always comes from the server.
+function interpolateMultiplier(elapsedSeconds, growthRate = 0.08) {
+  if (elapsedSeconds <= 0) return 1.0;
+  return Math.floor(Math.exp(growthRate * elapsedSeconds) * 100) / 100;
+}
+
+export function GameProvider({ children }) {
+  const auth = useContext(AuthContext);
+  const wallet = useContext(WalletContext);
+  const { syncFromServerTime, now } = useServerTime();
+
+  const [round, setRound] = useState(null); // { round_id, status, ... }
+  const [multiplier, setMultiplier] = useState(1.0);
+  const [activeBet, setActiveBet] = useState(null);
+  const [recentRounds, setRecentRounds] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [lastCrash, setLastCrash] = useState(null);
+
+  const runningSinceRef = useRef(null); // server-time Date the current round started RUNNING
+  const rafRef = useRef(null); // handle for the in-flight interpolation frame, so we can kill it synchronously
+  const statusRef = useRef(null); // mirrors round?.status for synchronous reads inside tick()
+
+  useEffect(() => {
+    statusRef.current = round?.status;
+  }, [round?.status]);
+
+  const pushNotification = useCallback((notification) => {
+    const id = generateId();
+    setNotifications((prev) => [...prev, { id, ...notification }]);
+    setTimeout(() => {
+      setNotifications((prev) => prev.filter((n) => n.id !== id));
+    }, 5000);
+  }, []);
+
+  const handleMessage = useCallback(
+    (msg) => {
+      if (msg.server_time) syncFromServerTime(msg.server_time);
+
+      switch (msg.type) {
+        case "state.sync": {
+          setRound(msg.round);
+          setActiveBet(msg.active_bet ? { ...msg.active_bet, bet_id: msg.active_bet.id } : null);
+          if (msg.wallet_balance) wallet?.setBalanceFromServer(msg.wallet_balance);
+          if (msg.round?.status === "RUNNING") {
+            runningSinceRef.current = new Date(msg.server_time);
+          }
+          break;
+        }
+
+        case "round.started": {
+          // A fresh round is starting — make sure no stray interpolation frame
+          // from the previous round is still queued to fire on top of this reset.
+          if (rafRef.current) {
+            cancelAnimationFrame(rafRef.current);
+            rafRef.current = null;
+          }
+          setRound({
+            round_id: msg.round_id,
+            status: "BETTING_OPEN",
+            server_seed_hash: msg.server_seed_hash,
+            client_seed: msg.client_seed,
+            nonce: msg.nonce,
+            betting_closes_at: msg.betting_closes_at,
+          });
+          setMultiplier(1.0);
+          setActiveBet(null);
+          setLastCrash(null);
+          break;
+        }
+
+        case "round.running": {
+          runningSinceRef.current = new Date(msg.server_time);
+          setRound((prev) => (prev ? { ...prev, status: "RUNNING" } : prev));
+          break;
+        }
+
+        case "multiplier.update": {
+          setMultiplier(parseFloat(msg.multiplier));
+          break;
+        }
+
+        case "round.crashed": {
+          // Kill any in-flight interpolation frame immediately. Do NOT wait for
+          // the effect cleanup below (tied to round.status changing) — that
+          // runs after commit, one or more frames later, and a stray tick
+          // queued before this message can otherwise overwrite the frozen
+          // crash value with a live number (including one from the NEXT round
+          // once round.started resets things). This was the source of the
+          // multiplier/notification mismatch (e.g. showing 4.0 vs 4.6).
+          if (rafRef.current) {
+            cancelAnimationFrame(rafRef.current);
+            rafRef.current = null;
+          }
+          const crashValue = parseFloat(msg.crash_multiplier);
+          setRound((prev) => (prev ? { ...prev, status: "CRASHED" } : prev));
+          setMultiplier(crashValue);
+          setLastCrash(crashValue);
+          setActiveBet((prev) => (prev && prev.status === "ACTIVE" ? { ...prev, status: "LOST" } : prev));
+          // Push the crash straight into the history chips instantly, instead of
+          // waiting for the next REST refetch of /aviator/history/.
+          setRecentRounds((prev) => {
+            const alreadyThere = prev.some((r) => r.round_id === msg.round_id);
+            if (alreadyThere) return prev;
+            return [{ round_id: msg.round_id, crash_multiplier: msg.crash_multiplier }, ...prev].slice(0, 50);
+          });
+          pushNotification({ kind: "crash", text: `Crashed at ${msg.crash_multiplier}x` });
+          break;
+        }
+
+        case "round.settled": {
+          setRound((prev) => (prev ? { ...prev, status: "SETTLED" } : prev));
+          break;
+        }
+
+        case "bet.confirmed": {
+          setActiveBet({ bet_id: msg.bet_id, amount: msg.amount, status: "ACTIVE" });
+          wallet?.setBalanceFromServer(msg.balance);
+          pushNotification({ kind: "success", text: `Bet placed: ${msg.amount}` });
+          break;
+        }
+
+        case "bet.rejected": {
+          pushNotification({ kind: "error", text: msg.reason || "Bet rejected" });
+          break;
+        }
+
+        case "cashout.success": {
+          setActiveBet((prev) =>
+            prev ? { ...prev, status: "CASHED_OUT", cashout_multiplier: msg.multiplier, payout: msg.payout } : prev
+          );
+          wallet?.setBalanceFromServer(msg.balance);
+          pushNotification({ kind: "success", text: `Cashed out at ${msg.multiplier}x — +${msg.payout}` });
+          break;
+        }
+
+        case "cashout.failed": {
+          // Bet stays ACTIVE so the cash-out button re-enables and the user can
+          // retry immediately, instead of freezing on a rejected attempt.
+          setActiveBet((prev) => (prev ? { ...prev, status: "ACTIVE" } : prev));
+          pushNotification({ kind: "error", text: msg.reason || "Cash-out failed" });
+          break;
+        }
+
+        default:
+          break;
+      }
+    },
+    [syncFromServerTime, wallet, pushNotification]
+  );
+
+  const ws = useWebSocket(handleMessage);
+
+  // Smooth client-side interpolation between authoritative multiplier broadcasts.
+  useEffect(() => {
+    if (round?.status !== "RUNNING" || !runningSinceRef.current) return;
+
+    const tick = () => {
+      // Belt-and-suspenders: bail instantly if the round has moved on, even if
+      // this frame was already queued (via requestAnimationFrame) before the
+      // status changed. statusRef is updated synchronously via the effect
+      // above, so this check is not subject to the same lag as cleanup.
+      if (statusRef.current !== "RUNNING") return;
+
+      const elapsed = (now().getTime() - runningSinceRef.current.getTime()) / 1000;
+      setMultiplier((prevServerAligned) => {
+        const interpolated = interpolateMultiplier(elapsed);
+        // Never let interpolation run ahead of what makes visual sense; the next
+        // authoritative multiplier.update message will correct any drift anyway.
+        return Math.max(prevServerAligned, interpolated);
+      });
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+    };
+  }, [round?.status, now]);
+
+  // Initial load + reconnect resync via REST (covers the gap before the WS opens).
+  const syncFromRest = useCallback(async () => {
+    if (!auth?.isAuthenticated) return;
+    try {
+      const data = await api.getCurrentRound();
+      syncFromServerTime(data.server_time);
+      setRound(data.round);
+      setActiveBet(data.active_bet ? { ...data.active_bet, bet_id: data.active_bet.id } : null);
+      if (data.wallet_balance) wallet?.setBalanceFromServer(data.wallet_balance);
+      if (data.round?.status === "RUNNING") {
+        runningSinceRef.current = new Date(data.server_time);
+      }
+    } catch {
+      // ignore — WS state.sync will follow shortly after connecting
+    }
+  }, [auth?.isAuthenticated, syncFromServerTime, wallet]);
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const data = await api.getGameHistory();
+      setRecentRounds(data);
+    } catch {
+      // non-critical
+    }
+  }, []);
+
+  useEffect(() => {
+    syncFromRest();
+    loadHistory();
+  }, [syncFromRest, loadHistory]);
+
+  // Bet / cash-out actions — optimistic UI handled by the calling component;
+  // this just wraps the REST calls with request IDs for idempotency.
+  const placeBet = useCallback(async (amount, autoCashoutMultiplier) => {
+    const requestId = generateId();
+    const bet = await api.placeBet({ amount, requestId, autoCashoutMultiplier });
+    setActiveBet({ bet_id: bet.id, amount: bet.amount, status: bet.status });
+    return bet;
+  }, []);
+
+  const cashOutBet = useCallback(async () => {
+    if (!activeBet?.bet_id) return;
+    const requestId = generateId();
+    const bet = await api.cashOut({ betId: activeBet.bet_id, requestId });
+    setActiveBet((prev) => ({
+      ...prev,
+      status: bet.status,
+      cashout_multiplier: bet.cashout_multiplier,
+      payout: bet.payout,
+    }));
+    return bet;
+  }, [activeBet]);
+
+  return (
+    <GameContext.Provider
+      value={{
+        connectionStatus: ws.status,
+        round,
+        multiplier,
+        activeBet,
+        recentRounds,
+        notifications,
+        lastCrash,
+        placeBet,
+        cashOutBet,
+        refreshHistory: loadHistory,
+        requestStateSync: ws.requestStateSync,
+      }}
+    >
+      {children}
+    </GameContext.Provider>
+  );
+}
